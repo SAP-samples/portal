@@ -4,6 +4,8 @@
 ## Description
 Implementation of the deep learning models with training and evaluation pipelines described in the paper "PORTAL: Scalable Tabular Foundation Models via Content-Specific Tokenization" published at 3rd Table Representation Learning Workshop at NeurIPS 2024
 
+![logo](https://github.com/SAP-samples/portal/model_architecture.pdf)
+
 ## Requirements
 
 The requirements are detailed in the `requirements.txt` file
