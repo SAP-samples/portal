@@ -14,7 +14,7 @@ The requirements are detailed in the `requirements.txt` file
 
 To run the model finetuning on the `carte` or `50k_subsample` datasets:
 ```
-python3 -m portal.portal YOUR_RUN_NAME --regression_loss=mixed --patience=20 --max_epochs 100 --dataset=carte
+python3 -m portal.portal YOUR_RUN_NAME --patience=20 --max_epochs 100 --dataset=carte --regression_loss=l2 --regression_target_normalization standard
 ```
 
 For the detailed description of the parameters, please check the the `parse_args` function in the `portal/portal.py` file

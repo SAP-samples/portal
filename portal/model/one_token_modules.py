@@ -14,9 +14,7 @@ from portal.model.torch_modules import (
     DateEmbeddings,
     MultiHeadedModel,
     NumberEmbeddings,
-    create_tenant_mask,
     embedding_model_to_dimension_and_pooling,
-    masked_argmax,
 )
 from portal.utils.target_properties import TargetProperties
 
@@ -145,63 +143,11 @@ class TextHead(SSLHead):
         return loss
 
 
-class TripletHead(SSLHead):
-    def __init__(self, config, is_cosine_similarity=False):
-        super().__init__(config, ['triplet'], [config.hidden_size], [])
-        self.is_cosine_similarity = is_cosine_similarity
-
-    def calc_euclidean(self, x1, x2):
-        return (x1 - x2).pow(2).sum(1).sqrt()
-
-    def forward(self, features: torch.Tensor, loss_mask: torch.Tensor, triplet_classes=None, is_validation=False):
-        x = self.dense(features)
-        x = gelu(x)
-        x = self.layer_norm(x)
-
-        logits = {k: layer(x) for k, layer in self.layers.items()}
-
-        if is_validation:
-            # return the embedding for the input row
-            return logits, None
-        else:
-            logits_triplet = logits['triplet']
-            batch_split = logits_triplet.shape[0] // 3
-            anchor = logits_triplet[:batch_split, :]
-            positive = logits_triplet[batch_split:-batch_split, :]
-            negative = logits_triplet[-batch_split:, :]
-
-            if triplet_classes is None:
-                if self.is_cosine_similarity:
-                    current_margin = 0.1
-                else:
-                    current_margin = 1
-            else:
-                # include distance between percentile classes. Far away percentile classes should be separated by larger margin
-                if self.is_cosine_similarity:
-                    current_margin = 0.1 + torch.abs(triplet_classes[:, 1] - triplet_classes[:, 0]) / 200.0
-                else:
-                    current_margin = 1.0 + torch.abs(triplet_classes[:, 1] - triplet_classes[:, 0]) / 10.0
-
-            # triplet_loss = functional.triplet_margin_loss(anchor, positive, negative, margin=1, reduction='none')
-            if self.is_cosine_similarity:
-                distance_positive = 1 - functional.cosine_similarity(anchor, positive)
-                distance_negative = 1 - functional.cosine_similarity(anchor, negative)
-            else:
-                distance_positive = self.calc_euclidean(anchor, positive)
-                distance_negative = self.calc_euclidean(anchor, negative)
-
-            triplet_loss = torch.relu(distance_positive - distance_negative + current_margin)
-
-            triplet_loss = (triplet_loss * loss_mask[:, 0]).sum() / (loss_mask[:, 0] + 1e-5).sum()
-            return {'triplet': anchor}, triplet_loss
-
-
 class RobertaSSL(nn.Module, ModuleUtilsMixin):
     def __init__(self,
                  sentence_embedding_model_name: str,
                  model_size: ModelSize,
                  use_number_percentiles=True,
-                 is_triplet=False,
                  regression_type='cross_entropy',
                  dropout_rate=0.1):
         super().__init__()
@@ -229,10 +175,6 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
                                    regression_type=regression_type)
         self.date_head = SSLHead(self.config, ['date_year', 'date_month', 'date_day'], [51, 13, 32], [])
         self.text_head = TextHead(self.config, sentence_embedding_model_name)
-        self.is_triplet = is_triplet
-        if self.is_triplet:
-            self.triplet_head = TripletHead(self.config)
-            self.cls_token = nn.Parameter(torch.randn(1, 1, self.config.hidden_size))
 
     def forward(self,
                 input_ids: Dict,
@@ -242,7 +184,6 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
                 anchor_ids: Optional[torch.Tensor] = None,
                 positive_ids: Optional[Dict] = None,
                 negative_ids: Optional[Dict] = None,
-                triplet_loss_mask: Optional[torch.Tensor] = None,
                 is_validation=False,
                 **kwargs):
         device = input_ids['is_positive'].device
@@ -251,60 +192,8 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
             attention_mask = torch.ones(input_size, device=device)
         input_embeds = self.embeddings(input_ids)
 
-        if self.is_triplet:
-            # case for validation
-            if is_validation:
-                anchor_embeds = self.embeddings(labels)
-
-                # extend mask for CLS token
-                attention_mask_ext = torch.ones((attention_mask.shape[0], 1), device=attention_mask.device)
-                attention_mask = torch.column_stack((attention_mask_ext, attention_mask))
-                attention_mask = torch.cat([attention_mask, attention_mask])
-
-                cls_token = self.cls_token.repeat(input_embeds.shape[0], 1, 1)
-                input_embeds = torch.column_stack((cls_token, input_embeds))  # tokens is of shape [B, 1+T, F]
-                anchor_embeds = torch.column_stack((cls_token, anchor_embeds))  # tokens is of shape [B, 1+T, F]
-
-                # we pass through transformer input_ids and anchor
-                input_embeds = torch.cat([input_embeds, anchor_embeds])
-                input_size = torch.tensor([input_size[0] * 2, input_size[1] + 1])
-            else:
-                anchor_embeds = self.embeddings(anchor_ids)
-                positive_embeds = self.embeddings(positive_ids)
-                negative_embeds = self.embeddings(negative_ids)
-
-                # extend mask for CLS token
-                attention_mask_ext = torch.ones((attention_mask.shape[0], 1), device=attention_mask.device)
-                attention_mask = torch.column_stack((attention_mask_ext, attention_mask))
-                attention_mask = torch.cat([attention_mask, attention_mask, attention_mask, attention_mask])
-
-                cls_token = self.cls_token.repeat(input_embeds.shape[0], 1, 1)
-                input_embeds = torch.column_stack((cls_token, input_embeds))  # tokens is of shape [B, 1+T, F]
-                anchor_embeds = torch.column_stack((cls_token, anchor_embeds))  # tokens is of shape [B, 1+T, F]
-                positive_embeds = torch.column_stack((cls_token, positive_embeds))  # tokens is of shape [B, 1+T, F]
-                negative_embeds = torch.column_stack((cls_token, negative_embeds))  # tokens is of shape [B, 1+T, F]
-
-                input_embeds = torch.cat([input_embeds, anchor_embeds, positive_embeds, negative_embeds])
-                input_size = torch.tensor([input_size[0] * 4, input_size[1] + 1])
-
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_size)
         encoder_outputs = self.encoder(input_embeds, attention_mask=extended_attention_mask, return_dict=False)
-
-        if self.is_triplet:
-            encoder_output_without_cls = encoder_outputs[0][:, 1:, :]
-            # case for validation
-            if is_validation:
-                # skip input_embeds, get anchor
-                encoder_output_cls = encoder_outputs[0][input_embeds.shape[0] // 2:, 0, :]
-                encoder_outputs = encoder_output_without_cls[:input_embeds.shape[0] // 2, :, :]
-                encoder_outputs = (encoder_outputs, )
-                attention_mask = attention_mask[:attention_mask.shape[0] // 2, 1:]
-            else:
-                # skip input_embeds, get anchor, positive, negative
-                encoder_output_cls = encoder_outputs[0][input_embeds.shape[0] // 4:, 0, :]
-                encoder_outputs = encoder_output_without_cls[:input_embeds.shape[0] // 4, :, :]
-                encoder_outputs = (encoder_outputs, )
-                attention_mask = attention_mask[:attention_mask.shape[0] // 4, 1:]
 
         number_mask = date_mask = text_mask = is_text = None
         is_number, is_date = input_ids['is_number'], input_ids['is_date']
@@ -320,17 +209,6 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
         label_embeddings = labels['content_embeddings'] if labels is not None else None
         logits, loss_text = self.text_head(encoder_outputs[0], label_embeddings, text_mask)
 
-        if self.is_triplet:
-            if is_validation:
-                logits_triplet, loss_triplet = self.triplet_head(encoder_output_cls, None, is_validation=is_validation)
-            else:
-                logits_triplet, loss_triplet = self.triplet_head(encoder_output_cls,
-                                                                 triplet_loss_mask,
-                                                                 is_validation=is_validation)
-            logits.update(logits_triplet)
-        else:
-            loss_triplet = torch.tensor(float('nan'))
-
         logits.update(logits_number)
         logits.update(logits_date)
 
@@ -341,7 +219,7 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
         assert number_mask is not None and date_mask is not None and text_mask is not None  # Just to silence VisualStudio errors
 
         # Text loss is computed below
-        result['loss'] = {'number': loss_number, 'date': loss_date, 'text': loss_text, 'triplet': loss_triplet}
+        result['loss'] = {'number': loss_number, 'date': loss_date, 'text': loss_text}
         result['counts'] = {
             'number': is_number.sum(),
             'date': is_date.sum(),
@@ -350,7 +228,6 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
             'loss_number': number_mask.sum(),
             'loss_date': date_mask.sum(),
             'loss_text': text_mask.sum(),
-            'loss_triplet': loss_triplet,
         }
 
         return result
@@ -386,7 +263,7 @@ class MultiHeadedOneTokenPerCellModel(MultiHeadedModel):
                                              sentence_embedding_model_name=tokenizer_model_name,
                                              use_number_percentiles=use_number_percentiles)
 
-    def forward(self, input_ids, labels=None, attention_mask=None, tenant_id=None, **kwargs):
+    def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
         device = input_ids['is_positive'].device
         input_size = input_ids['is_positive'].size()
 
@@ -395,173 +272,4 @@ class MultiHeadedOneTokenPerCellModel(MultiHeadedModel):
 
         input_embeds = self.embeddings(input_ids)
 
-        return self.forward_post_embeddings(input_embeds, attention_mask, input_size, labels, tenant_id=tenant_id)
-
-
-class MultiHeadedOneTokenPerCellTripletModel(MultiHeadedOneTokenPerCellModel):
-    def __init__(self,
-                 target_to_properties: Dict[str, TargetProperties],
-                 model_size: ModelSize,
-                 tokenizer_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
-                 use_number_percentiles: bool = False,
-                 weighted_loss_dict: Optional[Dict[str, Dict[int, float]]] = None,
-                 regression_as_classification=False,
-                 is_cosine_similarity=False,
-                 **kwargs):
-        self.regression_as_classification = regression_as_classification
-        self.is_cosine_similarity = is_cosine_similarity
-        super().__init__(target_to_properties, model_size, tokenizer_model_name, use_number_percentiles,
-                         weighted_loss_dict)
-
-    def create_heads(self):
-        self.triplet_head = TripletHead(self.config, is_cosine_similarity=self.is_cosine_similarity)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.config.hidden_size))
-
-    def forward(self,
-                input_ids,
-                positive_ids=None,
-                negative_ids=None,
-                triplet_loss_mask=None,
-                triplet_classes=None,
-                labels=None,
-                attention_mask=None,
-                tenant_id=None,
-                is_validation=False,
-                **kwargs):
-        device = input_ids['is_positive'].device
-        input_size = input_ids['is_positive'].size()
-
-        # we have extra CLS token
-        if is_validation:
-            input_size = (input_size[0], input_size[1] + 1)
-        else:
-            # we pass input, positive, negative at once
-            input_size = (3 * input_size[0], input_size[1] + 1)
-
-        if attention_mask is None:
-            attention_mask = torch.ones(input_size, device=device)
-
-        input_embeds = self.embeddings(input_ids)
-
-        positive_embeds, negative_embeds = None, None
-        if is_validation == False:
-            positive_embeds = self.embeddings(positive_ids)
-            negative_embeds = self.embeddings(negative_ids)
-
-        return self.forward_post_embeddings(input_embeds,
-                                            attention_mask,
-                                            input_size,
-                                            labels,
-                                            positive_embeds,
-                                            negative_embeds,
-                                            triplet_loss_mask,
-                                            triplet_classes,
-                                            is_validation=is_validation)
-
-    def forward_post_embeddings(self,
-                                input_embeds,
-                                attention_mask,
-                                input_size,
-                                labels,
-                                positive_embeds=None,
-                                negative_embeds=None,
-                                triplet_loss_mask=None,
-                                triplet_classes=None,
-                                is_validation=False):
-        cls_token = self.cls_token.repeat(input_embeds.shape[0], 1, 1)
-        input_embeds = torch.column_stack((cls_token, input_embeds))  # tokens is of shape [B, 1+T, F]
-        if is_validation == False:
-            positive_embeds = torch.column_stack((cls_token, positive_embeds))  # tokens is of shape [B, 1+T, F]
-            negative_embeds = torch.column_stack((cls_token, negative_embeds))  # tokens is of shape [B, 1+T, F]
-            input_embeds = torch.cat([input_embeds, positive_embeds, negative_embeds])
-
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_size)
-        encoder_outputs = self.encoder(input_embeds, attention_mask=extended_attention_mask, return_dict=False)
-        sequence_output = encoder_outputs[0]
-
-        sequence_output_cls = sequence_output[:, 0, :]
-        if not self.regression_as_classification:
-            # consider triplet classes for margin calculation only if we use percentiles in the regression task
-            triplet_classes = None
-        logits, loss = self.triplet_head(sequence_output_cls,
-                                         triplet_loss_mask,
-                                         triplet_classes=triplet_classes,
-                                         is_validation=is_validation)
-
-        output = (logits, ) + encoder_outputs[1:]
-        return ((loss, ) + output) if loss is not None else output
-
-
-class OneTokenPerCellLikeSSLModel(RobertaSSL):
-    # This wrapper modifies the __init__ to be compatible with MultiHeadedOneTokenPerCellModel
-    # However, outputs will _not_ be compatible, this needs to be taken care of by the lightning module
-    def __init__(self,
-                 target_to_properties: Dict[str, TargetProperties],
-                 model_size: ModelSize,
-                 tokenizer_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
-                 use_number_percentiles: bool = False,
-                 regression_type: str = 'mixed',
-                 **kwargs):
-        # This model doesn't care about target_to_properties, since it will always
-        # make a prediction per each token, both the targets and the features.
-        super().__init__(sentence_embedding_model_name=tokenizer_model_name,
-                         use_number_percentiles=use_number_percentiles,
-                         model_size=model_size,
-                         regression_type=regression_type)
-
-        self.target_to_properties = target_to_properties
-        self.regression_type = regression_type
-        self.cosine_similarity = torch.nn.CosineSimilarity(dim=2)
-
-    def extract_classification_predictions(self,
-                                           logits: Dict[str, torch.Tensor],
-                                           target_properties: TargetProperties,
-                                           tenant_id: Optional[List[str]] = None):
-        text_logits = logits['text']
-        # Shape: (batch_size, EMBEDDING_DIMENSION)
-        assert text_logits.ndim == 2
-        # Shape: (num_classes, EMBEDDING_DIMENSION)
-        assert target_properties.class_embeddings is not None and target_properties.class_embeddings.ndim == 2, str(
-            target_properties.class_embeddings)
-
-        similarities = self.cosine_similarity(text_logits.detach().float().cpu().unsqueeze(1),
-                                              target_properties.class_embeddings.unsqueeze(0))
-        if tenant_id:
-            mask = create_tenant_mask(shape=similarities.shape,
-                                      values_per_tenant=target_properties.values_per_tenant,
-                                      tenant_id=tenant_id)
-            argmax = partial(masked_argmax, mask=mask)
-        else:
-            argmax = torch.argmax
-
-        return argmax(similarities, dim=1)
-
-    def extract_predictions(self,
-                            logits: Dict[str, torch.Tensor],
-                            tenant_id: Optional[List[str]] = None,
-                            as_probabilities=False):
-        predictions = {}
-
-        column_name_to_id = {str(name): i for i, name in enumerate(logits['column_names'])}
-
-        for head_name, target_properties in self.target_to_properties.items():
-            if head_name not in column_name_to_id:
-                # This column was not present in the input data (probably constant and thus dropped)
-                continue
-            this_id = column_name_to_id[head_name]
-            these_logits = {k: v[:, this_id] for k, v in logits.items() if k != 'column_names'}
-
-            if target_properties.type == 'classification':
-                predictions[head_name] = self.extract_classification_predictions(these_logits,
-                                                                                 target_properties,
-                                                                                 tenant_id=tenant_id)
-                if as_probabilities:
-                    # This method is not able to predict probabilities (at least, without calibration).
-                    # We just return probability 1 for the most likely class.
-                    preds = torch.zeros(these_logits['text'].shape[0], target_properties.size, dtype=torch.float32)
-                    preds[torch.arange(preds.shape[0]), predictions[head_name]] = 1.0
-            else:
-                number_mask = torch.ones(these_logits['is_positive'].shape[0], dtype=torch.bool)
-                predictions[head_name] = self.extract_regression_predictions(these_logits, number_mask)
-
-        return predictions
+        return self.forward_post_embeddings(input_embeds, attention_mask, input_size, labels)

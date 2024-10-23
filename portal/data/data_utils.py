@@ -1,13 +1,16 @@
 import datetime
 from math import log, nan
 from typing import List, Optional, Union
-
 import holidays
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytz
 import torch
 from tqdm import tqdm
+
+warnings.filterwarnings('ignore', message='Diwali and Holi holidays available from 2001 to 2030 only', category=Warning)
 
 # For scientific notation m * base**n, we take n to be between -127 and 127 (like for Float32)
 # To avoid bugs, keep the following number odd.
@@ -22,60 +25,12 @@ BASE = 2.0
 date_cache = {}
 
 
-def _text_and_positional_encoding(texts, tokenizer):
-    special_token_ids = [tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.eos_token_id]
-    special_token_ids = [i for i in special_token_ids if i is not None]
-
-    input_ids = tokenizer(texts).input_ids
-    # Skip BOS and EOS everywhere (padding shouldn't be there at this point)
-    input_ids = [[idx for idx in these_input_ids if idx not in special_token_ids] for these_input_ids in input_ids]
-    # Both positional and cell ids start from 1, because we reserve 0 for padding
-    # We also flatten all the results.
-    cell_ids = [i for i, iids in enumerate(input_ids, 1) for _ in iids]
-    input_ids = [x for i in input_ids for x in i]
-
-    prev_value = -1
-    curr_index = 0
-    position_ids = []
-    for cell_id in cell_ids:
-        if cell_id == prev_value:
-            curr_index += 1
-            position_ids.append(curr_index)
-        else:
-            prev_value = cell_id
-            position_ids.append(1)
-            curr_index = 1
-
-    return input_ids, cell_ids, position_ids
-
-
-def safe_to_timestamp(x):
-    try:
-        if isinstance(x, datetime.date):
-            t = datetime.datetime.combine(x, datetime.time(0, tzinfo=pytz.UTC)).timestamp()
-        else:
-            t = x.timestamp()
-        if t < 0:
-            return np.nan
-        else:
-            return t
-    except (AttributeError, ValueError):
-        # For some unexplainable reason, NaT doesn't automatically convert to NaN, we need to do this manually...
-        return np.nan
-
 
 def _str_to_num(x: str):
     try:
         return float(x)
     except ValueError:
         pass
-
-    # TODO: rather than guessing, should use locales.
-    # If have a good estimate of which locale the database is in (e.g. de_DE.UTF-8 for Germany),
-    # then we can use:
-    #   import locale
-    #   locale.setlocale(locale.LC_ALL, 'de_DE.UTF-8')
-    #   return locale.atof(x)
 
     if ',' in x:
         try:
@@ -139,20 +94,6 @@ def to_numeric(row: pd.Series,
             numeric_series[idx] = _str_to_num(string_row[idx])
 
     return numeric_series.astype(float)
-
-
-def attempt_convert_dates(df, cols_to_skip=[]):
-    print('Trying to convert columns to date type')
-    # Convert values like 20230101 to dates instead of ints
-    for column in tqdm(df.columns):
-        if column in cols_to_skip:
-            continue
-        if not (df[column].apply(str).str.len() == 0).all():
-            try:
-                df[column] = pd.to_datetime(df[column].apply(str))
-            except ValueError:
-                # Not a date, nothing to do
-                pass
 
 
 class DateFeatures:
@@ -305,8 +246,6 @@ def encode_numbers_torch_no_binning(number_row: torch.Tensor):
         - subtracting 1 if exponent is even
         - mapping x -> 2 - x if exponent is odd
     Which makes changes from one exponent to the next smooth for fraction.
-    TODO: eventually align the two, if this works better, also modify encode_numbers_no_binning
-          (will require rerunning SSL pretraining as this changes inputs!)
     Input: torch tensor of shape (n,)
     Output:
         - is_positive: torch tensor of shape (n,) and dtype bool
@@ -345,8 +284,6 @@ def encode_numbers_torch(number_row: torch.Tensor):
         while fraction_bin = 999 and delta = 1 to fraction = 2.0
     - for odd exponent, fraction_bin = 0 and delta = 0 corresponds to fraction = 2.0,
         while fraction_bin = 999 and delta = 1 to fraction = 1.0
-    TODO: eventually align the two, if this works better, also modify encode_numbers
-          (will require rerunning SSL pretraining as this changes inputs!)
     Input: torch tensor of shape (n,)
     Output:
         - is_positive: torch tensor of shape (n,) and dtype bool
@@ -425,7 +362,6 @@ def decode_numbers_torch(is_positive, exponent, fraction_bin, delta=0.5):
     Applies the inverse transformation as that in encode_numbers_torch
     To be used:
     - in MultiHeadedModel extract_predictions for cross entropy regression
-    TODO: eventually in SSL model, as well.
     """
     assert BASE == 2, 'Only base 2 is supported for now'
     fraction01 = (fraction_bin + delta) / FRACTION_BINS
@@ -461,59 +397,3 @@ def encode_dates(raw_row: pd.Series):
     # - 7 bits for one-hot encoded weekday
     # - 120 bits for is-a-holiday in each country supported by holidays package
     return date_year, date_month, date_day, date_weekday, date_holidays
-
-
-def tokenized_row_encoder(raw_row: pd.Series, number_row: pd.Series, target, tokenizer, column_to_id: dict,
-                          tenant_id: Optional[str]):
-    is_positive, exponent, fraction_bin, delta = encode_numbers(number_row)
-    date_year, date_month, date_day, date_weekday, date_holidays = encode_dates(raw_row)
-
-    # Text embedding:
-    text_values = [str(x) for x in raw_row.values]
-    # For datetime that are actually just dates, remove the time
-    for i in range(len(text_values)):
-        if isinstance(raw_row.iloc[i], datetime.datetime) and text_values[i].endswith(' 00:00:00'):
-            text_values[i] = text_values[i][:-9]
-
-    input_ids, cell_ids, position_ids = _text_and_positional_encoding(text_values, tokenizer)
-
-    column_ids = [column_to_id[x] for x in raw_row.index]
-
-    # Let's broadcast numbers, dates, and column embeddings to the same shape as input_ids and the rest.
-    # We can use cell_ids, which is:
-    # - 0 for special tokens (e.g. BOS/EOS)
-    # - an int between 1 and self.df.shape[1] for the rest, giving the id of the column
-
-    def align(vector):
-        return [vector[i - 1] for i in cell_ids]
-
-    aligned_is_positive = align(is_positive)
-    aligned_exponent = align(exponent)
-    aligned_fraction_bin = align(fraction_bin)
-    aligned_delta = align(delta)
-    aligned_year = align(date_year)
-    aligned_month = align(date_month)
-    aligned_day = align(date_day)
-    aligned_weekday = align(date_weekday)
-    aligned_holidays = align(date_holidays)
-    aligned_columns = align(column_ids)
-
-    result = {
-        'input_ids': input_ids,  # list of lists of int
-        'number_is_positive': aligned_is_positive,
-        'number_exponent': aligned_exponent,
-        'number_fraction_bin': aligned_fraction_bin,
-        'number_delta': aligned_delta,
-        'date_year': aligned_year,
-        'date_month': aligned_month,
-        'date_day': aligned_day,
-        'date_weekday': aligned_weekday,
-        'date_holidays': aligned_holidays,
-        'column_ids': aligned_columns,
-        'position_ids': position_ids,
-        'labels': target,
-        'attention_mask': [1] * len(input_ids),
-        'tenant_id': tenant_id,
-    }
-
-    return result

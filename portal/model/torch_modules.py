@@ -112,7 +112,7 @@ class MultiHeadedModel(ABC, nn.Module, ModuleUtilsMixin):
     def create_embeddings(self):
         ...
 
-    def forward_post_embeddings(self, input_embeds, attention_mask, input_size, labels, tenant_id=None):
+    def forward_post_embeddings(self, input_embeds, attention_mask, input_size, labels):
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_size)
         encoder_outputs = self.encoder(input_embeds, attention_mask=extended_attention_mask, return_dict=False)
         sequence_output = encoder_outputs[0]
@@ -122,19 +122,6 @@ class MultiHeadedModel(ABC, nn.Module, ModuleUtilsMixin):
             for target_name in self.target_to_properties
         }
         mask_per_target = None
-        if tenant_id is not None:
-            # fixme: this is probably terribly inefficient
-            #        it would be much nicer to pass a generic "loss_mask" into this,
-            #        (just a bit harder to implement, needs some re-work in the data module)
-            mask_per_target = {}
-            for target_name, target_properties in self.target_to_properties.items():
-                if target_properties.values_per_tenant is not None:
-                    valid_indices_mask = torch.zeros_like(logits[target_name],
-                                                          dtype=torch.bool)  # (batch_size, num_classes)
-                    for i, t in enumerate(tenant_id):
-                        valid_indices_mask[i, list(target_properties.values_per_tenant[t])] = 1
-                    mask_per_target[target_name] = valid_indices_mask
-
         loss = self.compute_loss(labels, logits, mask_per_target=mask_per_target)
 
         output = (logits, ) + encoder_outputs[1:]
@@ -274,7 +261,6 @@ class MultiHeadedModel(ABC, nn.Module, ModuleUtilsMixin):
 
     def extract_predictions(self,
                             logits: Dict[str, torch.Tensor],
-                            tenant_id: Optional[List[str]] = None,
                             as_probabilities=False):
         """
         logits: dict[str, Tensor], with Tensor of shape (batch_size, d) where d depends on the task:
@@ -286,17 +272,9 @@ class MultiHeadedModel(ABC, nn.Module, ModuleUtilsMixin):
         for head_name, target_properties in self.target_to_properties.items():
             if target_properties.type == 'classification':
                 if as_probabilities:
-                    assert tenant_id is None, 'Not yet implemented'
                     predictions[head_name] = torch.softmax(logits[head_name], dim=1)
                 else:
-                    if tenant_id and target_properties.values_per_tenant is not None:
-                        mask = create_tenant_mask(shape=logits[head_name].shape,
-                                                  values_per_tenant=target_properties.values_per_tenant,
-                                                  tenant_id=tenant_id)
-                        argmax = partial(masked_argmax, mask=mask)
-                    else:
-                        argmax = torch.argmax
-                    predictions[head_name] = argmax(logits[head_name], dim=1)
+                    predictions[head_name] = torch.argmax(logits[head_name], dim=1)
             else:
                 if target_properties.regression_type == 'l2':
                     predictions[head_name] = logits[head_name].squeeze(-1).float()
@@ -316,15 +294,3 @@ class MultiHeadedModel(ABC, nn.Module, ModuleUtilsMixin):
                         # take softmax of these two values, and define delta accordingly.
                         predictions[head_name] = decode_numbers_torch(is_positive, exponent_pred, fraction_bin)
         return predictions
-
-
-def create_tenant_mask(shape, values_per_tenant: Dict, tenant_id: List[str]) -> torch.Tensor:
-    mask = torch.zeros(shape, dtype=torch.bool)
-    for i, t in enumerate(tenant_id):
-        mask[i, list(values_per_tenant[t])] = 1
-    return mask
-
-
-def masked_argmax(logits: torch.Tensor, mask: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    masked_logits = torch.where(mask, logits, torch.tensor(float('-inf')).to(logits.device))
-    return masked_logits.argmax(*args, **kwargs)

@@ -25,11 +25,9 @@ class TargetProperties:
                  type: Literal['classification', 'regression'],
                  classes: Optional[Union[int, list]] = None,
                  regression_type: Optional[Literal['cross_entropy', 'mixed', 'l2']] = None,
-                 string_tokenizer: Optional['StringTokenizer'] = None,
-                 values_per_tenant: Optional[Dict[str, Set[int]]] = None):
+                 string_tokenizer: Optional['StringTokenizer'] = None):
         self.type = type
         self.regression_type = regression_type
-        self.values_per_tenant = values_per_tenant  # valid label values per tenant
         self.class_list = None
         self.class_embeddings = None
 
@@ -99,8 +97,5 @@ class TargetProperties:
         return {
             'type': self.type,
             'size': self.size,
-            'regression_type': self.regression_type,
-            'values_per_tenant':
-            {k: list(v)
-             for k, v in self.values_per_tenant.items()} if self.values_per_tenant is not None else None
+            'regression_type': self.regression_type
         }

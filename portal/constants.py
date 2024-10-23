@@ -21,13 +21,11 @@ DEFAULT_ZMQ_PORT: Final[int] = 5555
 
 BEST_CKPT_FILENAME: Final[str] = 'best.ckpt'
 UNKNOWN_CLASS_LABEL_ID: Final[int] = -100
-TENANT_ID_COL = '__tenant_id__'
 
 
 OPEN_FINE_TUNE_EXPERIMENT_NAME = {
     'carte': 'OpenFineTuneResultsCarte',
-    '50k_subsample': 'OpenFineTuneResults50k',
-    'vime': 'OpenFineTuneResultsVime',
+    '50k_subsample': 'OpenFineTuneResults50k'
 }
 
 
@@ -40,9 +38,6 @@ class SplitName:
 class ModelType(Enum):
     DUMMY = 'dummy'  # Used for unit tests
     ONE_TOKEN_PER_CELL = 'one-token-per-cell'
-    MANY_TOKENS_PER_CELL = 'many-tokens-per-cell'
-    ONE_TOKEN_PER_CELL_LIKE_SSL = 'one-token-per-cell-like-ssl'
-    ONE_TOKEN_PER_CELL_TRIPLET = 'one-token-per-cell-triplet'
 
 
 class ModelTypeAction(argparse.Action):

@@ -43,28 +43,3 @@ def pad_other_values(other_values):
         # but still pad_sequence works for them
         'content_embeddings': pad_sequence([value['content_embeddings'] for value in other_values], batch_first=True)
     }
-
-
-def collate_fn(samples):
-    result = {}
-    result['input_ids'] = pad_list_of_dict([sample['input_ids'] for sample in samples])
-    if samples[0].get('triplet_loss_mask') is not None:
-        result['anchor_ids'] = pad_list_of_dict([sample['anchor_ids'] for sample in samples])
-        result['positive_ids'] = pad_list_of_dict([sample['positive_ids'] for sample in samples])
-        result['negative_ids'] = pad_list_of_dict([sample['negative_ids'] for sample in samples])
-        result['triplet_loss_mask'] = pad_sequence([sample['triplet_loss_mask'] for sample in samples], batch_first=True)
-
-    result['labels'] = pad_list_of_dict([sample['labels'] for sample in samples])
-    result['attention_mask'] = pad_sequence([torch.ones_like(sample['loss_mask']) for sample in samples],
-                                            batch_first=True)
-    result['loss_mask'] = pad_sequence([sample['loss_mask'] for sample in samples], batch_first=True)
-
-    if 'filename' in samples[0]:
-        result['filename'] = [sample['filename'] for sample in samples]
-    if 'row_index' in samples[0]:
-        result['row_index'] = [sample['row_index'] for sample in samples]
-
-    if 'other_values' in samples[0]:
-        # This happens only in validation
-        result['other_values'] = pad_other_values([sample['other_values'] for sample in samples])
-    return result

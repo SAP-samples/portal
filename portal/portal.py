@@ -27,13 +27,9 @@ from transformers import get_linear_schedule_with_warmup
 
 from portal.constants import CACHE_PATH, ModelSize, ModelSizeAction, ModelType, ModelTypeAction
 from portal.data.one_token_per_cell import ModularizedRowTokenizer
-from portal.data.one_token_per_cell.collate import collate_fn as pretraining_collate_fn
 from portal.data.one_token_per_cell.collate import pad_list_of_dict
-from portal.data.tabular_datasets import GenericTokenizedDatasetOneTokenPerCellLikeSSL
 from portal.model.one_token_modules import (
     MultiHeadedOneTokenPerCellModel,
-    MultiHeadedOneTokenPerCellTripletModel,
-    OneTokenPerCellLikeSSLModel,
 )
 
 from portal.scripts.start_embedding_server import embedding_server_starter
@@ -58,7 +54,6 @@ def parse_args(args=None):
     parser.add_argument('-rl', '--regression_loss', default='mixed', choices=['cross_entropy', 'l2', 'mixed'])
     parser.add_argument('-lbs', '--run_subset', default=None, nargs='+')
     parser.add_argument('--is_cosine_similarity', action='store_true')
-    parser.add_argument('--is_remove_ssl_heads', action='store_true')
     parser.add_argument('-d',
                         '--dataset',
                         default='carte',
@@ -120,7 +115,7 @@ def get_train_test_sizes(train_size):
 
 
 def get_key_list(run_subset: Optional[list] = None,
-                 dataset: Literal['carte', 'numeric', '50k_subsample', 'vime'] = 'carte'):
+                 dataset: Literal['carte', 'numeric', '50k_subsample'] = 'carte'):
     if dataset == 'numeric':
         dataset = '50k_subsample'
 
@@ -252,81 +247,6 @@ class MyDataset(Dataset):
         return {'input_ids': tokenized_row}
 
 
-class MyDatasetTriplet(MyDataset):
-    def __getitem__(self, index):
-        if index >= len(self.df):
-            raise IndexError('Out of bounds!')
-
-        tokenized_row = self.get_from_cache_or_tokenize(index)
-        tokenized_row['labels'] = {self.target_column: self.target.loc[index]}
-
-        if self.target_column_reg_save:
-            tokenized_row['labels_regression'] = {self.target_column_reg_save: self.target_regression.loc[index]}
-
-        if self.is_validation == False:
-            index_positive, index_negative = self.pick_triplet_indices(index)
-            if index_positive is None:
-                print('index_positive is None, skipping')
-                return self.__getitem__(index + 1)
-            positive_ids = self.get_from_cache_or_tokenize(index_positive)
-            negative_ids = self.get_from_cache_or_tokenize(index_negative)
-            triplet_loss_mask = torch.tensor([True])
-            triplet_classes = torch.tensor([self.target.loc[index], self.target.loc[index_negative]])
-
-            return {
-                'input_ids': tokenized_row,
-                'positive_ids': positive_ids,
-                'negative_ids': negative_ids,
-                'triplet_loss_mask': triplet_loss_mask,
-                'triplet_classes': triplet_classes,
-            }
-        return {'input_ids': tokenized_row}
-
-    def pick_triplet_indices(self, index):
-        '''
-        Positive rows are the ones that have the same value in the selected column.
-        '''
-        mask_same_values_in_column = self.target == self.target.loc[index]
-        mask_different_values_in_column = ~mask_same_values_in_column
-        # set mask element to False at the place of the current row.
-        # We want to pick a different similar row, not the same one
-        mask_same_values_in_column.at[self.df.loc[index].name] = False
-
-        index_positive, index_positive = None, None
-        if mask_same_values_in_column.sum() > 0 and mask_different_values_in_column.sum() > 0:
-            index_positive = random.choice(mask_same_values_in_column.index[mask_same_values_in_column])
-            index_negative = random.choice(mask_different_values_in_column.index[mask_different_values_in_column])
-        return index_positive, index_negative
-
-
-class MyDatasetLikeSSL(MyDataset):
-    def convert_target(self, id_mappings):
-        # Just converting to string if classification
-        if self.is_classification:
-            self.target = self.target.astype(str)
-        else:
-            self.target = self.target.astype(float)
-
-    def __getitem__(self, index):
-        if index >= len(self.df):
-            # Raise IndexError rather than the default KeyError, so to signal to the PyTorch DataLoader
-            # that it should transform it to a StopIterationError.
-            raise IndexError('Out of bounds!')
-
-        if self.is_classification:
-            # Target is always a single column here, so we need to add 1
-            override_is_text = np.zeros(len(self.df.columns) + 1, dtype=bool)
-            override_is_text[-1] = True
-        else:
-            override_is_text = None
-
-        return GenericTokenizedDatasetOneTokenPerCellLikeSSL.format_data(self.df.loc[index],
-                                                                         self.target.to_frame().loc[index],
-                                                                         self.row_tokenizer,
-                                                                         self.id_mappings,
-                                                                         override_is_text=override_is_text)
-
-
 def collate_fn(samples):
     result = {}
     samples_without_labels = [{
@@ -351,13 +271,6 @@ def collate_fn(samples):
             for col in label_cols
         }
 
-    if samples[0].get('triplet_loss_mask') is not None:
-        result['positive_ids'] = pad_list_of_dict([sample['positive_ids'] for sample in samples])
-        result['negative_ids'] = pad_list_of_dict([sample['negative_ids'] for sample in samples])
-        result['triplet_loss_mask'] = pad_sequence([sample['triplet_loss_mask'] for sample in samples],
-                                                   batch_first=True)
-        result['triplet_classes'] = pad_sequence([sample['triplet_classes'] for sample in samples], batch_first=True)
-
     return result
 
 
@@ -366,52 +279,31 @@ def collate_labels(samples, key='labels'):
     return {col: torch.tensor([sample[key][col] for sample in samples]) for col in label_cols}
 
 
-def collate_fn_like_ssl(samples):
-    result = pretraining_collate_fn(samples)
-    result['column_names'] = samples[0]['column_names']
-    if samples[0].get('human_readable_labels') is not None:
-        result['human_readable_labels'] = collate_labels(samples, key='human_readable_labels')
-    return result
-
-
 def to_device(d, device):
     if isinstance(d, dict):
         return {k: to_device(v, device) for k, v in d.items() if k not in ['column_names', 'human_readable_labels']}
     return d.to(device)
 
 
-def extract_loss(result, is_like_ssl, is_classification):
-    if not is_like_ssl:
-        return result[0]
-    if is_classification:
-        return result['loss']['text']
-    return result['loss']['number']
+def extract_loss(result):
+    return result[0]
 
 
 def extract_predictions(result,
-                        is_like_ssl,
                         target_column,
                         batch,
                         model,
                         classification_to_regression_map,
                         as_probabilities=False):
-    assert not (is_like_ssl and classification_to_regression_map), 'Unknown combination'
     if as_probabilities:
-        if is_like_ssl or (classification_to_regression_map is not None):
+        if classification_to_regression_map is not None:
             raise NotImplementedError('predict_proba not implemented for these cases yet')
         return model.extract_predictions(result[1], as_probabilities=True)[target_column].detach().cpu().numpy()
 
-    if not is_like_ssl:
-        eval_preds = model.extract_predictions(result[1])[target_column].detach().cpu().numpy().flatten()
-        if classification_to_regression_map is not None:
-            # map percentiles to regression values
-            eval_preds = [classification_to_regression_map[e] for e in eval_preds]
-    else:
-        # From here, like SSL
-        logits = result['logits']
-        logits['column_names'] = batch['column_names']
-        eval_preds = model.extract_predictions(logits)[target_column].detach().cpu().numpy().flatten()
-
+    eval_preds = model.extract_predictions(result[1])[target_column].detach().cpu().numpy().flatten()
+    if classification_to_regression_map is not None:
+        # map percentiles to regression values
+        eval_preds = [classification_to_regression_map[e] for e in eval_preds]
     return eval_preds
 
 
@@ -504,7 +396,7 @@ class DatasetMetadata:
         self.df = self.df.dropna(subset=self.target_column)
 
         if not self.is_classification:
-            if trainer.model_type == ModelType.ONE_TOKEN_PER_CELL_TRIPLET or trainer.regression_as_classification:
+            if trainer.regression_as_classification:
                 # Regression as classification. We map regression values to percentiles before splitting into train, test, val sets
                 self.target_column_reg_save = self.target_column
                 self.df, self.classification_to_regression_map = map_regression_to_classification(
@@ -579,7 +471,6 @@ class Trainer:
                  checkpoint_path=None,
                  regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = 'l2',
                  is_cosine_similarity=False,
-                 is_remove_ssl_heads=False,
                  train_size=None,
                  test_size: Optional[float] = .2,
                  bagging=None,
@@ -599,11 +490,6 @@ class Trainer:
         self.model_size = model_size
         self.model_type = model_type
         self.batch_size = batch_size
-
-        if model_type == ModelType.ONE_TOKEN_PER_CELL_TRIPLET:
-            # as we have anchor, positive, negative examples so during training we have 3 x batch_size
-            self.batch_size = 16
-
         self.num_epochs = num_epochs
         self.patience = patience
         self.warmup_epochs = warmup_epochs
@@ -612,7 +498,6 @@ class Trainer:
         self.checkpoint_path = checkpoint_path
         self.regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = regression_loss
         self.is_cosine_similarity = is_cosine_similarity
-        self.is_remove_ssl_heads = is_remove_ssl_heads
         self.train_size = train_size
         self.test_size = test_size
         self.bagging = bagging
@@ -719,23 +604,6 @@ class Trainer:
             model = MultiHeadedOneTokenPerCellModel(target_to_properties,
                                                     model_size=self.model_size,
                                                     dropout_rate=self.dropout_rate)
-            is_like_ssl = False
-        elif self.model_type == ModelType.ONE_TOKEN_PER_CELL_TRIPLET:
-            model = MultiHeadedOneTokenPerCellTripletModel(
-                target_to_properties,
-                model_size=self.model_size,
-                regression_as_classification=self.metadata.classification_to_regression_map is not None,
-                is_cosine_similarity=self.is_cosine_similarity,
-                dropout_rate=self.dropout_rate)
-            is_like_ssl = False
-        elif self.model_type == ModelType.ONE_TOKEN_PER_CELL_LIKE_SSL:
-            model = OneTokenPerCellLikeSSLModel(target_to_properties,
-                                                model_size=self.model_size,
-                                                regression_type=self.regression_loss,
-                                                dropout_rate=self.dropout_rate)
-            is_like_ssl = True
-            if self.checkpoint_path is None:
-                print('\n\nWARNING: OneTokenPerCellLikeSSL should really use a pretrained checkpoint.\n\n')
         else:
             raise ValueError(f'Unsupported model type: {self.model_type}')
 
@@ -744,15 +612,11 @@ class Trainer:
         if self.checkpoint_path is not None:
             with fsspec.open(self.checkpoint_path, 'rb') as f:
                 state_dict = torch.load(f, map_location=self.device)  # type: ignore
-                if self.is_remove_ssl_heads:
-                    for l in list(state_dict.keys()):
-                        if 'number_head' in l or 'date_head' in l or 'text_head' in l:
-                            state_dict.pop(l)
 
             assert check_encoder_architecture_matching(state_dict, model), 'Model encoder architecture different than the one in the checkpoint'
             model.load_state_dict(state_dict, strict=False)
 
-        return model, is_like_ssl
+        return model
 
     def train_model_on_one_split(self, train, val):
         assert isinstance(self.metadata, DatasetMetadata)
@@ -786,7 +650,7 @@ class Trainer:
                 self.metadata.target_column: TargetProperties('regression', regression_type=self.regression_loss)
             }
 
-        model, is_like_ssl = self.build_model(target_to_properties)
+        model = self.build_model(target_to_properties)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         lr_scheduler = get_linear_schedule_with_warmup(
@@ -809,17 +673,11 @@ class Trainer:
 
                 for batch in tqdm(train_dataloader, leave=False):
                     result = model(**to_device(batch, self.device))
-                    loss = extract_loss(result, is_like_ssl, self.metadata.is_classification)
+                    loss = extract_loss(result)
                     loss.backward()
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
-
-                if self.model_type == ModelType.ONE_TOKEN_PER_CELL_TRIPLET:
-                    if epoch_idx % 3 != 0 or epoch_idx == 0:
-                        # for triplet loss, evaluate only every 3rd epoch as evaluation is expensive
-                        # because we generate reference embeddings for the entire training set
-                        continue
 
                 loss, metric = self.predict_and_evaluate(model, val, 'val', train_dataloader)
                 valid_metrics.append(metric)
@@ -855,79 +713,29 @@ class Trainer:
         else:
             classification_to_regression_map = None  # is this superfluous?
 
-        if isinstance(model, MultiHeadedOneTokenPerCellTripletModel):
-            if as_probabilities:
-                raise NotImplementedError('Not implemented yet')
-            number_of_classes = model.target_to_properties[self.metadata.target_column].size
-            pred_per_class = torch.zeros((number_of_classes, model.model_size[1]))
-            counter_per_class = torch.zeros((number_of_classes))
+        for batch in tqdm(dataloader, leave=False):
+            with torch.no_grad():
+                result = model(**to_device(batch, self.device))
+            loss = extract_loss(result)
+            preds = extract_predictions(result,
+                                        self.metadata.target_column,
+                                        batch,
+                                        model,
+                                        classification_to_regression_map=classification_to_regression_map,
+                                        as_probabilities=as_probabilities)
+            eval_preds.extend(preds)
 
-            # generate centers of classes for the training set, a little bit too time consuming
-            for batch in tqdm(train_dataloader, leave=False, desc='Reference class centers generation'):
-                with torch.no_grad():
-                    batch = to_device(batch, self.device)
-                    batch.update({'is_validation': True})
-                    pred = model(**batch)[0]
-                    for l, p in zip(batch['labels'][self.metadata.target_column].detach().cpu(),
-                                    pred['triplet'].detach().float().cpu()):
-                        pred_per_class[l.item()] += p
-                        counter_per_class[l.item()] += 1
+            labels_target_column = self.metadata.target_column
+            if self.metadata.target_column_reg_save:
+                # use real regression values as labels (not percentiles)
+                labels_key = 'labels_regression'
+                labels_target_column = self.metadata.target_column_reg_save
+            else:
+                labels_key = 'labels'
 
-            counter_per_class[counter_per_class == 0] = 1
-            pred_per_class = pred_per_class / counter_per_class.unsqueeze(1)
-            cosine_similarity = torch.nn.CosineSimilarity(dim=2)
-
-            for batch in tqdm(dataloader, leave=False):
-                with torch.no_grad():
-                    batch_updated = to_device(batch, self.device)
-                    batch_updated.update({'is_validation': True})
-                    pred = model(**batch_updated)[0]
-
-                if model.is_cosine_similarity:
-                    similarities = cosine_similarity(pred['triplet'].detach().float().cpu().unsqueeze(1),
-                                                     pred_per_class.unsqueeze(0))
-                    sim = torch.argmax(similarities, dim=1)
-                else:
-                    pred_examples = pred['triplet'].detach().float().cpu().unsqueeze(1)
-                    reference_classes_preds = pred_per_class.unsqueeze(0)
-                    similarities = (pred_examples - reference_classes_preds).pow(2).sum(2).sqrt()
-                    sim = torch.argmin(similarities, dim=1)
-
-                eval_preds.extend(sim.numpy().flatten())
-                if self.metadata.target_column_reg_save:
-                    # use real regression values as labels
-                    eval_labels.extend(batch['labels_regression'][self.metadata.target_column_reg_save].numpy())
-                else:
-                    eval_labels.extend(batch['labels'][self.metadata.target_column].numpy())
-            loss = None
-        else:
-            is_like_ssl = isinstance(model, OneTokenPerCellLikeSSLModel)
-            for batch in tqdm(dataloader, leave=False):
-                with torch.no_grad():
-                    result = model(**to_device(batch, self.device))
-                loss = extract_loss(result, is_like_ssl, self.metadata.is_classification)
-                preds = extract_predictions(result,
-                                            is_like_ssl,
-                                            self.metadata.target_column,
-                                            batch,
-                                            model,
-                                            classification_to_regression_map=classification_to_regression_map,
-                                            as_probabilities=as_probabilities)
-                eval_preds.extend(preds)
-
-                labels_target_column = self.metadata.target_column
-                if self.metadata.target_column_reg_save:
-                    # use real regression values as labels (not percentiles)
-                    labels_key = 'labels_regression'
-                    labels_target_column = self.metadata.target_column_reg_save
-                elif is_like_ssl:
-                    labels_key = 'human_readable_labels'
-                else:
-                    labels_key = 'labels'
-
-                eval_labels.extend(batch[labels_key][labels_target_column].numpy())
-                eval_losses.append(loss.item())
-            loss = np.mean(eval_losses)
+            eval_labels.extend(batch[labels_key][labels_target_column].numpy())
+            eval_losses.append(loss.item())
+        loss = np.mean(eval_losses)
 
         if self.output_folder is not None:
             target_folder = Path(self.output_folder).joinpath(self.output_subfolder_name).joinpath(
@@ -967,14 +775,7 @@ class Trainer:
 
     def get_dataset(self, df, name, is_validation=False):
         assert isinstance(self.metadata, DatasetMetadata)
-        if self.model_type == ModelType.ONE_TOKEN_PER_CELL_LIKE_SSL:
-            class_name = MyDatasetLikeSSL
-        elif self.model_type == ModelType.ONE_TOKEN_PER_CELL_TRIPLET:
-            class_name = MyDatasetTriplet
-        else:
-            class_name = MyDataset
-
-        return class_name(df.reset_index(drop=True),
+        return MyDataset(df.reset_index(drop=True),
                           self.metadata.target_column,
                           is_classification=self.metadata.is_classification,
                           id_mappings=self.metadata.id_mappings,
@@ -985,14 +786,10 @@ class Trainer:
                           processed_dataset_cache=self.processed_dataset_cache)
 
     def get_dataloader(self, dataset, shuffle):
-        if self.model_type == ModelType.ONE_TOKEN_PER_CELL_LIKE_SSL:
-            this_collate_fn = collate_fn_like_ssl
-        else:
-            this_collate_fn = collate_fn
         return DataLoader(dataset,
                           batch_size=self.batch_size,
                           shuffle=shuffle,
-                          collate_fn=this_collate_fn,
+                          collate_fn=collate_fn,
                           num_workers=guess_num_workers(self.proc_per_gpu))
 
 
@@ -1009,8 +806,7 @@ def main(run_name,
          regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = 'l2',
          run_subset=None,
          is_cosine_similarity=False,
-         is_remove_ssl_heads=False,
-         dataset: Literal['carte', '50k_subsample', 'numeric', 'vime'] = 'carte',
+         dataset: Literal['carte', '50k_subsample', 'numeric'] = 'carte',
          train_size=None,
          bagging=None,
          validation_random_state=42,
@@ -1047,7 +843,6 @@ def main(run_name,
                       checkpoint_path=checkpoint_path,
                       regression_loss=regression_loss,
                       is_cosine_similarity=is_cosine_similarity,
-                      is_remove_ssl_heads=is_remove_ssl_heads,
                       train_size=train_size,
                       test_size=test_size,
                       bagging=bagging,
@@ -1181,7 +976,6 @@ if __name__ == '__main__':
              regression_loss=args.regression_loss,
              run_subset=args.run_subset,
              is_cosine_similarity=args.is_cosine_similarity,
-             is_remove_ssl_heads=args.is_remove_ssl_heads,
              dataset=args.dataset,
              train_size=args.train_size,
              bagging=args.bagging,
