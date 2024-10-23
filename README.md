@@ -14,7 +14,7 @@ The requirements are detailed in the `requirements.txt` file
 
 To run the model finetuning on the `carte` or `numeric` datasets:
 ```
-python3 -m portal.portal YOUR_RUN_NAME --patience=20 --max_epochs 100 --dataset=carte --regression_loss=l2 --regression_target_normalization standard
+python3 -m portal.portal YOUR_RUN_NAME --patience=20 --max_epochs 100 --dataset=carte --regression_loss=l2 --regression_target_normalization standard -c checkpoints/pretrained_ckpt.pth
 ```
 
 For the detailed description of the parameters, please check the the `parse_args` function in the `portal/portal.py` file
