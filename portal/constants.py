@@ -1,62 +1,17 @@
 import argparse
-import getpass
 import os
-import re
-import subprocess
 from enum import Enum
-from io import StringIO
 from pathlib import Path
 from typing import Final
-
-import pandas as pd
-
 
 
 CACHE_PATH = Path(os.environ['HOME'], '.cache', 'portal')
 CACHE_PATH.mkdir(parents=True, exist_ok=True)
 print('CACHE_PATH:', CACHE_PATH)
 
-
 DEFAULT_ZMQ_PORT: Final[int] = 5555
 
-BEST_CKPT_FILENAME: Final[str] = 'best.ckpt'
 UNKNOWN_CLASS_LABEL_ID: Final[int] = -100
-
-
-OPEN_FINE_TUNE_EXPERIMENT_NAME = {
-    'carte': 'OpenFineTuneResultsCarte',
-    '50k_subsample': 'OpenFineTuneResults50k'
-}
-
-
-class SplitName:
-    TRAIN: Final[str] = 'train'
-    VALIDATION: Final[str] = 'validation'
-    TEST: Final[str] = 'test'
-
-
-class ModelType(Enum):
-    DUMMY = 'dummy'  # Used for unit tests
-    ONE_TOKEN_PER_CELL = 'one-token-per-cell'
-
-
-class ModelTypeAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        try:
-            # Search by value:
-            value = ModelType(values)
-        except ValueError:
-            # Search by key:
-            if not isinstance(values, str):
-                raise ValueError(
-                    f'{values} has type {type(values)} which is not string, but this does not match any of the possible values {ModelType.__members__.values()}'
-                )
-            try:
-                value = ModelType[values]
-            except KeyError:
-                possible_dict = {k: v.value for k, v in ModelType.__members__.items()}
-                raise ValueError(f'{values} is neither a value nor a key for ModelType: {possible_dict}')
-        setattr(namespace, self.dest, value)
 
 
 class ModelSize(Enum):

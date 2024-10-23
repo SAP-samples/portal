@@ -1,6 +1,5 @@
 from math import nan
 
-import torch
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -30,16 +29,3 @@ def pad_list_of_dict(list_of_dict):
         result[key] = pad_sequence([dictionary[key] for dictionary in list_of_dict], batch_first=True)
 
     return result
-
-
-def pad_other_values(other_values):
-    return {
-        # Each value of dates and numbers are 1d tensors of numbers
-        # (length: number_of_rows of the original dataframe they were in)
-        # We pad them with nan, which is unused in validation anyway
-        'dates': pad_sequence([value['date'] for value in other_values], padding_value=nan, batch_first=True),
-        'numbers': pad_sequence([value['number'] for value in other_values], padding_value=nan, batch_first=True),
-        # content_embeddings instead have two dimensions (number_of_rows, embedding_dim)
-        # but still pad_sequence works for them
-        'content_embeddings': pad_sequence([value['content_embeddings'] for value in other_values], batch_first=True)
-    }

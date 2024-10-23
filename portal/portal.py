@@ -3,7 +3,6 @@ import os
 import pickle
 import random
 import warnings
-from argparse import Namespace
 from hashlib import sha224
 from pathlib import Path
 from shutil import rmtree
@@ -20,12 +19,11 @@ import torch
 from imblearn.under_sampling import RandomUnderSampler
 from sklearn import metrics, model_selection
 from sklearn.preprocessing import FunctionTransformer, PowerTransformer, StandardScaler
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm, trange
 from transformers import get_linear_schedule_with_warmup
 
-from portal.constants import CACHE_PATH, ModelSize, ModelSizeAction, ModelType, ModelTypeAction
+from portal.constants import CACHE_PATH, ModelSize, ModelSizeAction
 from portal.data.one_token_per_cell import ModularizedRowTokenizer
 from portal.data.one_token_per_cell.collate import pad_list_of_dict
 from portal.model.one_token_modules import (
@@ -43,7 +41,6 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('run_name', type=str)
     parser.add_argument('--model_size', default=ModelSize.base, action=ModelSizeAction)
-    parser.add_argument('--model_type', default=ModelType.ONE_TOKEN_PER_CELL, action=ModelTypeAction)
     parser.add_argument('--max_epochs', type=int, default=100)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -53,12 +50,10 @@ def parse_args(args=None):
     parser.add_argument('--regression_as_classification', action='store_true')
     parser.add_argument('-rl', '--regression_loss', default='mixed', choices=['cross_entropy', 'l2', 'mixed'])
     parser.add_argument('-lbs', '--run_subset', default=None, nargs='+')
-    parser.add_argument('--is_cosine_similarity', action='store_true')
     parser.add_argument('-d',
                         '--dataset',
                         default='carte',
-                        choices=['numeric', 'carte', '50k_subsample'],
-                        help='50k_subsample and numeric are totally equivalent')
+                        choices=['numeric', 'carte'])
     parser.add_argument('-ts',
                         '--train_size',
                         type=int,
@@ -83,12 +78,12 @@ def parse_args(args=None):
         '--validation_random_state',
         type=int,
         default=42,
-        help='Random state to do the train/validation split. Can be set for "manual" bagging. Temporary only.')
+        help='Random state to do the train/validation split. Can be set for "manual" bagging.')
     parser.add_argument('-o',
                         '--output_folder',
                         default=None,
                         type=str,
-                        help='If provided, saves labels and predictions for the test dataset to this folder.')
+                        help='If provided, saves labels and predictions for the test&validation datasets to this folder.')
     parser.add_argument('--is_multi_gpu', action='store_true')
     parser.add_argument('--proc_per_gpu', type=int, default=1)
     parser.add_argument('--gpu_idx', type=int, default=0)
@@ -115,7 +110,7 @@ def get_train_test_sizes(train_size):
 
 
 def get_key_list(run_subset: Optional[list] = None,
-                 dataset: Literal['carte', 'numeric', '50k_subsample'] = 'carte'):
+                 dataset: Literal['carte', 'numeric'] = 'carte'):
     if dataset == 'numeric':
         dataset = '50k_subsample'
 
@@ -281,7 +276,7 @@ def collate_labels(samples, key='labels'):
 
 def to_device(d, device):
     if isinstance(d, dict):
-        return {k: to_device(v, device) for k, v in d.items() if k not in ['column_names', 'human_readable_labels']}
+        return {k: to_device(v, device) for k, v in d.items() if k != 'column_names'}
     return d.to(device)
 
 
@@ -291,7 +286,6 @@ def extract_loss(result):
 
 def extract_predictions(result,
                         target_column,
-                        batch,
                         model,
                         classification_to_regression_map,
                         as_probabilities=False):
@@ -461,7 +455,6 @@ class Trainer:
     def __init__(self,
                  run_name,
                  model_size,
-                 model_type,
                  batch_size=32,
                  num_epochs=50,
                  patience=5,
@@ -470,7 +463,6 @@ class Trainer:
                  regression_as_classification=False,
                  checkpoint_path=None,
                  regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = 'l2',
-                 is_cosine_similarity=False,
                  train_size=None,
                  test_size: Optional[float] = .2,
                  bagging=None,
@@ -488,7 +480,6 @@ class Trainer:
         self.run_name = run_name
         self.output_subfolder_name = run_name
         self.model_size = model_size
-        self.model_type = model_type
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.patience = patience
@@ -497,7 +488,6 @@ class Trainer:
         self.regression_as_classification = regression_as_classification
         self.checkpoint_path = checkpoint_path
         self.regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = regression_loss
-        self.is_cosine_similarity = is_cosine_similarity
         self.train_size = train_size
         self.test_size = test_size
         self.bagging = bagging
@@ -540,8 +530,8 @@ class Trainer:
                                                           random_state=self.validation_random_state,
                                                           test_size=0.1,
                                                           stratify=self.metadata.stratify)
-            model, train_dataloader = self.train_model_on_one_split(train, val)
-            test_loss, metric = self.predict_and_evaluate(model, self.metadata.test_df, 'test', train_dataloader)
+            model = self.train_model_on_one_split(train, val)
+            test_loss, metric = self.predict_and_evaluate(model, self.metadata.test_df, 'test')
         else:
             test_labels = None
             test_preds = []
@@ -554,12 +544,11 @@ class Trainer:
                 self.output_subfolder_name = f'{self.run_name}_{random_state}_{self.bagging}'
                 train, val = select_random_split_for_bagging(self.metadata.train_df, self.bagging,
                                                              self.metadata.stratify, random_state)
-                model, train_dataloader = self.train_model_on_one_split(train, val)
+                model = self.train_model_on_one_split(train, val)
 
                 these_labels, these_preds, test_loss = self.compute_predictions(model,
                                                                                 self.metadata.test_df,
                                                                                 'test',
-                                                                                train_dataloader,
                                                                                 as_probabilities=True)
 
                 these_labels = np.array(these_labels)
@@ -600,12 +589,9 @@ class Trainer:
 
     def build_model(self, target_to_properties):
         assert isinstance(self.metadata, DatasetMetadata)
-        if self.model_type == ModelType.ONE_TOKEN_PER_CELL:
-            model = MultiHeadedOneTokenPerCellModel(target_to_properties,
-                                                    model_size=self.model_size,
-                                                    dropout_rate=self.dropout_rate)
-        else:
-            raise ValueError(f'Unsupported model type: {self.model_type}')
+        model = MultiHeadedOneTokenPerCellModel(target_to_properties,
+                                                model_size=self.model_size,
+                                                dropout_rate=self.dropout_rate)
 
         model = model.to(self.device)
 
@@ -666,7 +652,7 @@ class Trainer:
         print('Saving to best_ckpt_path:', best_ckpt_path)
 
         with trange(self.num_epochs) as progress_bar:
-            for epoch_idx in progress_bar:
+            for _ in progress_bar:
                 model = model.train()
                 if self.metadata.classification_to_regression_map:
                     train_dataloader.dataset.under_sample_frequent_percentiles()  # type: ignore
@@ -679,7 +665,7 @@ class Trainer:
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
-                loss, metric = self.predict_and_evaluate(model, val, 'val', train_dataloader)
+                loss, metric = self.predict_and_evaluate(model, val, 'val')
                 valid_metrics.append(metric)
                 valid_losses.append(loss)
                 if len(valid_metrics) == 1 or metric > max(valid_metrics[:-1]):
@@ -697,9 +683,9 @@ class Trainer:
         checkpoint = torch.load(best_ckpt_path)
         model.load_state_dict(checkpoint)
 
-        return model, train_dataloader
+        return model
 
-    def compute_predictions(self, model, df, name: str, train_dataloader, as_probabilities):
+    def compute_predictions(self, model, df, name: str, as_probabilities):
         assert isinstance(self.metadata, DatasetMetadata)
         dataloader = self.get_dataloader(self.get_dataset(df, name, is_validation=True), shuffle=False)
 
@@ -719,7 +705,6 @@ class Trainer:
             loss = extract_loss(result)
             preds = extract_predictions(result,
                                         self.metadata.target_column,
-                                        batch,
                                         model,
                                         classification_to_regression_map=classification_to_regression_map,
                                         as_probabilities=as_probabilities)
@@ -748,11 +733,10 @@ class Trainer:
 
         return eval_labels, eval_preds, loss
 
-    def predict_and_evaluate(self, model, dataset_to_be_predicted, name: str, train_dataloader):
+    def predict_and_evaluate(self, model, dataset_to_be_predicted, name: str):
         eval_labels, eval_preds, test_loss = self.compute_predictions(model,
                                                                       dataset_to_be_predicted,
                                                                       name,
-                                                                      train_dataloader,
                                                                       as_probabilities=False)
 
         assert isinstance(self.metadata, DatasetMetadata)
@@ -795,7 +779,6 @@ class Trainer:
 
 def main(run_name,
          model_size,
-         model_type,
          max_epochs,
          patience,
          batch_size,
@@ -805,8 +788,7 @@ def main(run_name,
          checkpoint_path=None,
          regression_loss: Literal['l2', 'mixed', 'cross_entropy'] = 'l2',
          run_subset=None,
-         is_cosine_similarity=False,
-         dataset: Literal['carte', '50k_subsample', 'numeric'] = 'carte',
+         dataset: Literal['carte', 'numeric'] = 'carte',
          train_size=None,
          bagging=None,
          validation_random_state=42,
@@ -826,14 +808,12 @@ def main(run_name,
     # Add a random suffix, should we ever run two jobs on the same machine.
     processed_dataset_cache = CACHE_PATH.joinpath(f'processed_dataset_cache_{gpu_idx}_{proc_idx}_{random.randint(0, int(1e9))}')
 
-    key_list = get_key_list(run_subset=run_subset,
-                            dataset=dataset)
+    key_list = get_key_list(run_subset=run_subset, dataset=dataset)
     start_embedding_server()
     progress_bar = tqdm(key_list, desc='Looping through datasets')
 
     trainer = Trainer(run_name,
                       model_size,
-                      model_type,
                       batch_size=batch_size,
                       num_epochs=max_epochs,
                       patience=patience,
@@ -842,7 +822,6 @@ def main(run_name,
                       regression_as_classification=regression_as_classification,
                       checkpoint_path=checkpoint_path,
                       regression_loss=regression_loss,
-                      is_cosine_similarity=is_cosine_similarity,
                       train_size=train_size,
                       test_size=test_size,
                       bagging=bagging,
@@ -886,8 +865,6 @@ def main(run_name,
 
 
 def main_multi_gpu(args):
-    _, _, suffix = get_train_test_sizes(args.train_size)
-
     key_list = get_key_list(run_subset=args.run_subset,
                             dataset=args.dataset)
     start_embedding_server()
@@ -927,8 +904,6 @@ def main_multi_gpu(args):
             continue
         if k == 'model_size':
             v = v.name
-        elif k == 'model_type':
-            v = v.value
 
         if isinstance(v, bool) and v == True:
             arg_str += '--' + k + ' '
@@ -965,7 +940,6 @@ if __name__ == '__main__':
     else:
         main(args.run_name,
              args.model_size,
-             args.model_type,
              args.max_epochs,
              args.patience,
              args.batch_size,
@@ -975,7 +949,6 @@ if __name__ == '__main__':
              checkpoint_path=args.checkpoint_path,
              regression_loss=args.regression_loss,
              run_subset=args.run_subset,
-             is_cosine_similarity=args.is_cosine_similarity,
              dataset=args.dataset,
              train_size=args.train_size,
              bagging=args.bagging,

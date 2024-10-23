@@ -1,8 +1,7 @@
 import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 from torch import nn
