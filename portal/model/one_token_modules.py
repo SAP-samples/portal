@@ -1,5 +1,3 @@
-from functools import partial
-from math import log10
 from typing import Dict, List, Optional
 
 import torch
@@ -143,7 +141,7 @@ class TextHead(SSLHead):
         return loss
 
 
-class RobertaSSL(nn.Module, ModuleUtilsMixin):
+class SSLModel(nn.Module, ModuleUtilsMixin):
     def __init__(self,
                  sentence_embedding_model_name: str,
                  model_size: ModelSize,
@@ -180,12 +178,7 @@ class RobertaSSL(nn.Module, ModuleUtilsMixin):
                 input_ids: Dict,
                 labels: Optional[Dict] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                loss_mask: Optional[torch.Tensor] = None,
-                anchor_ids: Optional[torch.Tensor] = None,
-                positive_ids: Optional[Dict] = None,
-                negative_ids: Optional[Dict] = None,
-                is_validation=False,
-                **kwargs):
+                loss_mask: Optional[torch.Tensor] = None):
         device = input_ids['is_positive'].device
         input_size = input_ids['is_positive'].size()
         if attention_mask is None:

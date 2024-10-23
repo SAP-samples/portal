@@ -1,9 +1,7 @@
 import argparse
 import os
 import pickle
-import sqlite3
 import sys
-import threading
 
 import torch
 import zmq
@@ -17,14 +15,12 @@ if os.getcwd().startswith('/Workspace/Repos/'):
         if pkg_path not in sys.path:
             sys.path.append(pkg_path)
 
-from portal.constants import CACHE_PATH
 from portal.data.sentence_embedder import SentenceEmbedder
 from portal.utils.lru_cache import LRU_Cache
 
 cache = LRU_Cache(max_size=100000)
 sentence_embedding_model_name = 'sentence-transformers/all-MiniLM-L6-v2'
 sentence_embedder = SentenceEmbedder(sentence_embedding_model_name, 32)
-
 
 
 @torch.no_grad()
@@ -95,6 +91,7 @@ def main(port: int, context: zmq.Context):
         results = process_data(data)
         for element, result in zip(data, results):
             socket.send_multipart([element['client'], b'', result])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Benchmarking clients')

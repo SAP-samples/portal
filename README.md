@@ -12,7 +12,7 @@ The requirements are detailed in the `requirements.txt` file
 
 ## Download and Installation
 
-To run the model finetuning on the `carte` or `50k_subsample` datasets:
+To run the model finetuning on the `carte` or `numeric` datasets:
 ```
 python3 -m portal.portal YOUR_RUN_NAME --patience=20 --max_epochs 100 --dataset=carte --regression_loss=l2 --regression_target_normalization standard
 ```

@@ -6,9 +6,8 @@ import warnings
 
 import numpy as np
 import pandas as pd
-import pytz
 import torch
-from tqdm import tqdm
+
 
 warnings.filterwarnings('ignore', message='Diwali and Holi holidays available from 2001 to 2030 only', category=Warning)
 
