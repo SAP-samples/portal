@@ -2,7 +2,7 @@
 [![REUSE status](https://api.reuse.software/badge/github.com/SAP-samples/portal)](https://api.reuse.software/info/github.com/SAP-samples/portal)
 
 ## Description
-Implementation of the deep learning models with training and evaluation pipelines described in the paper "PORTAL: Scalable Tabular Foundation Models via Content-Specific Tokenization" published at 3rd Table Representation Learning Workshop at NeurIPS 2024. Link to the paper: https://arxiv.org/pdf/2410.13516
+Implementation of the deep learning models with training and evaluation pipelines described in the paper "PORTAL: Scalable Tabular Foundation Models via Content-Specific Tokenization" published at 3rd Table Representation Learning Workshop at NeurIPS 2024. Link to the paper: https://arxiv.org/pdf/2410.13516. Poster: [link](portal_poster_portrait.pdf)
 
 ![logo](https://github.com/SAP-samples/portal/blob/main/model_architecture.png)
 
