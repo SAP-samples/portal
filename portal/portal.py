@@ -205,19 +205,20 @@ class MyDataset(Dataset):
         string_row = str(self.df.loc[index].to_dict())
         hashed_identifier = sha224(string_row.encode()).hexdigest()
 
-        cache_file_path = self.processed_dataset_cache.joinpath(f'{hashed_identifier}.pickle')
-        if cache_file_path.exists():
-            try:
-                with open(cache_file_path, 'rb') as fp:
-                    tokenized_row = pickle.load(fp)
-            except:
-                # Sometimes loading fails; in that case, we just re-tokenize
-                # This is probably the case if there are two identical rows, so identical hashes,
-                # being created at the same time? So one process tries to read while the other
-                # is still writing.
-                print('Error in loading pickle, re-tokenizing')
-            else:
-                return tokenized_row
+        if self.processed_dataset_cache is not None:
+            cache_file_path = self.processed_dataset_cache.joinpath(f'{hashed_identifier}.pickle')
+            if cache_file_path.exists():
+                try:
+                    with open(cache_file_path, 'rb') as fp:
+                        tokenized_row = pickle.load(fp)
+                except:
+                    # Sometimes loading fails; in that case, we just re-tokenize
+                    # This is probably the case if there are two identical rows, so identical hashes,
+                    # being created at the same time? So one process tries to read while the other
+                    # is still writing.
+                    print('Error in loading pickle, re-tokenizing')
+                else:
+                    return tokenized_row
 
         tokenized_row = self.row_tokenizer(self.df.loc[index])
 
